@@ -91,63 +91,135 @@ export function mountScene(
   scene.add(avatar);
   const ray = new THREE.Raycaster();
   const mouse = new THREE.Vector2();
-  let hit: SceneHit | null = null;
-  const move = (e: PointerEvent) => {
-    const r = renderer.domElement.getBoundingClientRect();
-    mouse.set(
-      ((e.clientX - r.left) / r.width) * 2 - 1,
-      (-(e.clientY - r.top) / r.height) * 2 + 1,
-    );
-    ray.setFromCamera(mouse, camera);
-    const h = ray.intersectObjects(blocks.children)[0];
-    hit = null;
-    if (h && h.instanceId !== undefined && h.face) {
-      const cell = h.object.userData.cells[h.instanceId] as Vec3;
-      const n = h.face.normal;
-      hit = {
-        cell: { ...cell },
-        adjacent: { x: cell.x + n.x, y: cell.y + n.y, z: cell.z + n.z },
-      };
-      const p = state.tool === "place" ? hit.adjacent : hit.cell;
-      cursor.position.set(p.x + 0.5, p.y + 0.5, p.z + 0.5);
-    }
-    cursor.visible = !!hit;
+  const pointer = { x: 0, y: 0, inside: false };
+  let revision = state.doc.revision;
+  let hoverDirty = true;
+  let hoverRevision = -1;
+  let hoverTool = state.tool;
+  // Keep the instanced meshes in lockstep with the document so a pick can never
+  // target a block that was already removed (or miss one that was just placed).
+  const syncWorld = () => {
+    if (revision === state.doc.revision) return;
+    scene.remove(blocks);
+    disposeGroup(blocks);
+    blocks = blockMeshes(state.doc);
+    scene.add(blocks);
+    revision = state.doc.revision;
   };
-  let down = { x: 0, y: 0 };
+  // Re-pick against the camera and block meshes as they are right now, never a
+  // cached target: after an edit, a zoom, a drag or a world load the view and
+  // the world both change, so a stale hit would edit the wrong cell.
+  const pickAt = (clientX: number, clientY: number): SceneHit | null => {
+    const r = renderer.domElement.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return null;
+    if (
+      clientX < r.left ||
+      clientX > r.right ||
+      clientY < r.top ||
+      clientY > r.bottom
+    )
+      return null;
+    syncWorld();
+    mouse.set(
+      ((clientX - r.left) / r.width) * 2 - 1,
+      (-(clientY - r.top) / r.height) * 2 + 1,
+    );
+    camera.updateMatrixWorld();
+    ray.setFromCamera(mouse, camera);
+    scene.updateMatrixWorld();
+    // Nearest hit wins regardless of material: glass is picked exactly like an
+    // opaque block, and the block revealed behind a removed one is hit next.
+    const intersect = ray
+      .intersectObjects(blocks.children, false)
+      .sort((a, b) => a.distance - b.distance)[0];
+    if (!intersect || intersect.instanceId === undefined || !intersect.face)
+      return null;
+    const cell = intersect.object.userData.cells[intersect.instanceId] as Vec3;
+    if (!cell) return null;
+    const n = intersect.face.normal;
+    return {
+      cell: { x: cell.x, y: cell.y, z: cell.z },
+      adjacent: { x: cell.x + n.x, y: cell.y + n.y, z: cell.z + n.z },
+    };
+  };
+  // A press counts as a click only if the pointer never travelled far while the
+  // button was down, so an orbit that wanders and comes back cannot also build.
+  let press = { x: 0, y: 0, button: -1, travelled: 0 };
+  const trackDrag = (e: PointerEvent) => {
+    press.travelled = Math.max(
+      press.travelled,
+      Math.hypot(e.clientX - press.x, e.clientY - press.y),
+    );
+  };
+  const move = (e: PointerEvent) => {
+    pointer.x = e.clientX;
+    pointer.y = e.clientY;
+    pointer.inside = true;
+    hoverDirty = true;
+    if (press.button >= 0) trackDrag(e);
+  };
+  const leave = () => {
+    pointer.inside = false;
+    hoverDirty = true;
+  };
+  const cancel = () => {
+    press = { x: press.x, y: press.y, button: -1, travelled: 0 };
+    hoverDirty = true;
+  };
   const start = (e: PointerEvent) => {
-    down = { x: e.clientX, y: e.clientY };
+    pointer.x = e.clientX;
+    pointer.y = e.clientY;
+    pointer.inside = true;
+    press = { x: e.clientX, y: e.clientY, button: e.button, travelled: 0 };
+    hoverDirty = true;
   };
   const click = (e: PointerEvent) => {
-    if (
-      e.button === 0 &&
-      Math.hypot(e.clientX - down.x, e.clientY - down.y) < 5 &&
-      hit &&
-      state.mode === "build"
-    )
-      onHit(hit);
+    trackDrag(e);
+    // Ignore releases of unrelated buttons while the main press is still held.
+    if (e.button !== press.button) return;
+    const wasLeftPress = press.button === 0;
+    const dragged = press.travelled >= 5;
+    press = { x: e.clientX, y: e.clientY, button: -1, travelled: 0 };
+    // A drag is always a camera orbit/pan, never an edit. A genuine click is
+    // resolved once, here, from the release position and whatever the camera
+    // and world look like at this instant.
+    if (!wasLeftPress || dragged || state.mode !== "build") return;
+    pointer.x = e.clientX;
+    pointer.y = e.clientY;
+    pointer.inside = true;
+    const target = pickAt(e.clientX, e.clientY);
+    hoverDirty = true;
+    if (target) onHit(target);
   };
   renderer.domElement.addEventListener("pointermove", move);
+  renderer.domElement.addEventListener("pointerenter", move);
+  renderer.domElement.addEventListener("pointerleave", leave);
   renderer.domElement.addEventListener("pointerdown", start);
   renderer.domElement.addEventListener("pointerup", click);
+  renderer.domElement.addEventListener("pointercancel", cancel);
   const resize = new ResizeObserver(() => {
     const w = host.clientWidth,
       h = host.clientHeight;
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
     renderer.setSize(w, h);
+    hoverDirty = true;
   });
   resize.observe(host);
-  let frame = 0,
-    revision = -1;
+  const refreshHover = () => {
+    const next = pointer.inside ? pickAt(pointer.x, pointer.y) : null;
+    // The preview is what a click at this pointer position would act on: the
+    // same hit the click handler re-picks, so highlight and result never drift.
+    if (next) {
+      const p = state.tool === "place" ? next.adjacent : next.cell;
+      cursor.position.set(p.x + 0.5, p.y + 0.5, p.z + 0.5);
+    }
+    cursor.visible = !!next;
+  };
+  let frame = 0;
   function animate() {
     frame = requestAnimationFrame(animate);
-    if (revision !== state.doc.revision) {
-      scene.remove(blocks);
-      disposeGroup(blocks);
-      blocks = blockMeshes(state.doc);
-      scene.add(blocks);
-      revision = state.doc.revision;
-    }
+    syncWorld();
     avatar.position.set(
       state.doc.player.x,
       state.doc.player.y,
@@ -167,7 +239,20 @@ export function mountScene(
         Math.abs(a.z - b.z) + 1,
       );
     } else region.visible = false;
-    controls.update();
+    // Damping keeps moving the camera for several frames after a wheel or drag,
+    // so the preview must follow the settled view, not just pointer movement.
+    const moved = controls.update();
+    if (
+      moved ||
+      hoverDirty ||
+      revision !== hoverRevision ||
+      hoverTool !== state.tool
+    ) {
+      refreshHover();
+      hoverDirty = false;
+      hoverRevision = revision;
+      hoverTool = state.tool;
+    }
     renderer.render(scene, camera);
   }
   animate();
@@ -175,6 +260,7 @@ export function mountScene(
     reset() {
       camera.position.set(30, 27, 34);
       controls.target.set(0, 2, 0);
+      hoverDirty = true;
     },
     dispose() {
       cancelAnimationFrame(frame);
